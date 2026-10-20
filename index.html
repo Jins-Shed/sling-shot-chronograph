@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sling Shot Chronograph V1</title>
+<style>
+  :root { --bg:#0f1720; --card:#18222e; --fg:#e8eef5; --muted:#8b9bb0; --accent:#3ddc97; --warn:#ffb454; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--fg); transition:background 80ms linear; display:flex; justify-content:center; padding:24px; }
+  body.timing { background:#0b5d2e; }
+  main { width:100%; max-width:560px; }
+  h1 { font-size:1.3rem; margin:0 0 16px; }
+  .card { background:var(--card); border-radius:12px; padding:20px; margin-bottom:16px; }
+  #result { font-size:3.2rem; font-weight:700; text-align:center; font-variant-numeric:tabular-nums; color:var(--accent); }
+  #speed { font-size:1.6rem; font-weight:600; text-align:center; color:var(--fg); margin-top:4px; font-variant-numeric:tabular-nums; }
+  input[type=number] { width:100%; padding:8px; border-radius:6px; border:0; background:#0b1118; color:var(--fg); font-size:1rem; }
+  #status { text-align:center; color:var(--muted); margin-top:6px; min-height:1.4em; }
+  .meter { position:relative; height:18px; background:#0b1118; border-radius:9px; overflow:hidden; margin:8px 0 4px; }
+  #level { height:100%; width:0; background:var(--accent); transition:width 60ms linear; }
+  #lockBar { height:100%; width:0; background:var(--warn); }
+  #thrStart, #thrStop { position:absolute; top:0; bottom:0; width:2px; }
+  #thrStart { background:var(--warn); }
+  #thrStop { background:#ff6b6b; }
+  label { display:block; font-size:.85rem; color:var(--muted); margin-top:12px; }
+  input[type=range] { width:100%; }
+  button { background:var(--accent); color:#06210f; border:0; border-radius:8px; padding:12px 18px; font-size:1rem; font-weight:600; cursor:pointer; }
+  button.secondary { background:#2a3a4d; color:var(--fg); }
+  .row { display:flex; gap:10px; }
+  .row button { flex:1; }
+  ol { margin:8px 0 0; padding-left:22px; font-variant-numeric:tabular-nums; }
+  li { padding:2px 0; }
+  .stats { color:var(--muted); font-size:.9rem; margin-top:8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Sling Shot Chronograph V1</h1>
+
+  <div class="card">
+    <div id="result">-- ms</div>
+    <div id="speed">-- m/s</div>
+    <div id="status">Press Start listening, then make the start noise and the stop noise.</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button id="start">Start listening</button>
+      <button id="reset" class="secondary">Reset</button>
+    </div>
+    <label>Range Distance (m)</label>
+    <input id="range" type="number" min="0" step="any" value="12">
+    <label>Temperature °C (used to estimate speed of sound)</label>
+    <input id="temp" type="number" step="any" value="20">
+    <label>Speed of sound (m/s)</label>
+    <input id="sound" type="text" readonly>
+    <label>Time taken for sound to travel range</label>
+    <input id="soundTime" type="text" readonly>
+    <label>Mic level (orange line = start trigger, red line = stop trigger)</label>
+    <div class="meter"><div id="level"></div><div id="thrStart"></div><div id="thrStop"></div></div>
+    <label>Start threshold (orange): <span id="startVal"></span></label>
+    <input id="startSlider" type="range" min="1" max="100" value="30">
+    <label>Stop threshold (red): <span id="stopVal"></span></label>
+    <input id="stopSlider" type="range" min="1" max="100" value="30">
+    <label>Time Between Shots: <span id="gapVal"></span> s (start trigger is locked out after each measurement)</label>
+    <input id="gapSlider" type="range" min="1" max="20" step="0.5" value="5">
+    <div class="meter"><div id="lockBar"></div></div>
+    <div class="stats" id="lockText">Ready</div>
+    <label>Ignore the stop trigger for: <span id="deadVal"></span> ms after the timer starts</label>
+    <input id="deadSlider" type="range" min="10" max="500" value="80">
+  </div>
+
+  <div class="card">
+    <strong>History</strong>
+    <ol id="history"></ol>
+    <div class="stats" id="stats"></div>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let speeds = [], peakLevel = 0, locked = false;
+let ctx, node, gap = 5, lockUntil = 0, startThr = 0.3, stopThr = 0.3, dead = 0.08, frame = 0, last = -1e9, firstHit = null, results = [];
+
+function sendSettings() {
+  startThr = $('startSlider').value / 100;
+  stopThr = $('stopSlider').value / 100;
+  dead = $('deadSlider').value / 1000;
+  gap = +$('gapSlider').value;
+  $('gapVal').textContent = gap.toFixed(1);
+  $('startVal').textContent = startThr.toFixed(2);
+  $('stopVal').textContent = stopThr.toFixed(2);
+  $('deadVal').textContent = $('deadSlider').value;
+  $('thrStart').style.left = (startThr * 100) + '%';
+  $('thrStop').style.left = (stopThr * 100) + '%';
+}
+$('startSlider').oninput = sendSettings;
+$('stopSlider').oninput = sendSettings;
+$('deadSlider').oninput = sendSettings;
+$('gapSlider').oninput = sendSettings;
+function updateSound() {
+  const T = parseFloat($('temp').value);
+  const c = 331 + 0.6 * T;
+  $('sound').value = isNaN(T) ? '' : c.toFixed(1) + ' m/s';
+  const d = parseFloat($('range').value);
+  $('soundTime').value = (isNaN(T) || !(d >= 0) || !(c > 0)) ? '' : (d / c * 1000).toFixed(1) + ' ms';
+}
+$('range').addEventListener('input', updateSound);
+$('temp').oninput = updateSound;
+updateSound();
+sendSettings();
+
+function render() {
+  $('history').innerHTML = results.map((r, i) => ({ r, v: speeds[i] })).reverse().map(x =>
+    `<li>${x.v === null ? 'invalid' : x.v.toFixed(1) + ' m/s'} | ${x.r.toFixed(1)} ms</li>`).join('');
+  const v = speeds.filter(x => x !== null);
+  if (v.length) {
+    const avg = v.reduce((a, b) => a + b, 0) / v.length;
+    const sd = Math.sqrt(v.reduce((a, b) => a + (b - avg) ** 2, 0) / v.length);
+    $('stats').textContent = `Count ${v.length} | avg ${avg.toFixed(1)} m/s | min ${Math.min(...v).toFixed(1)} | max ${Math.max(...v).toFixed(1)} | std dev ${sd.toFixed(1)} m/s`;
+  } else $('stats').textContent = '';
+}
+
+function onStart(t) {
+  firstHit = t;
+  document.body.classList.add('timing');
+  $('status').textContent = 'Timer started. Waiting for the stop noise...';
+}
+
+function onStop(t) {
+  const ms = (t - firstHit) * 1000;
+  const d = parseFloat($('range').value);
+  const c = 331 + 0.6 * parseFloat($('temp').value);
+  const flight = ms / 1000 - d / c;
+  const v = d > 0 && c > 0 && flight > 0 ? d / flight : null;
+  results.push(ms);
+  speeds.push(v);
+  $('speed').textContent = v === null ? 'Check range, temperature and timing' : v.toFixed(1) + ' m/s | ' + (v * 3.28084).toFixed(1) + ' ft/s | ' + (v * 3.6).toFixed(1) + ' km/h';
+  $('result').textContent = ms >= 1000 ? (ms / 1000).toFixed(3) + ' s' : ms.toFixed(1) + ' ms';
+  $('status').textContent = 'Measured. Locked out for the Time Between Shots delay...';
+  firstHit = null;
+  document.body.classList.remove('timing');
+  lockUntil = t + gap;
+  locked = true;
+  render();
+}
+
+$('start').onclick = async () => {
+  if (ctx) return;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+    });
+    ctx = new AudioContext({ latencyHint: 'interactive' });
+    await ctx.resume();
+    node = ctx.createScriptProcessor(256, 1, 1);
+    const rate = ctx.sampleRate;
+    node.onaudioprocess = e => {
+      const ch = e.inputBuffer.getChannelData(0);
+      let peak = 0;
+      for (let i = 0; i < ch.length; i++) {
+        const a = Math.abs(ch[i]);
+        if (a > peak) peak = a;
+        if (firstHit === null) {
+          if (a > startThr && (frame + i) / rate >= lockUntil) { last = frame + i; onStart((frame + i) / rate); }
+        } else if (a > stopThr && (frame + i - last) / rate > dead) {
+          onStop((frame + i) / rate);
+        }
+      }
+      frame += ch.length;
+      peakLevel = Math.max(peakLevel, peak);
+    };
+    const src = ctx.createMediaStreamSource(stream);
+    const mute = ctx.createGain(); mute.gain.value = 0;
+    src.connect(node); node.connect(mute); mute.connect(ctx.destination);
+    setInterval(() => {
+      const remain = Math.max(0, lockUntil - frame / ctx.sampleRate);
+      $('lockBar').style.width = Math.min(100, remain / gap * 100) + '%';
+      $('lockText').textContent = remain > 0 ? 'Start locked: ' + remain.toFixed(1) + ' s remaining' : 'Ready';
+      if (locked && frame / ctx.sampleRate >= lockUntil) { locked = false; $('status').textContent = 'Ready. Waiting for the start noise.'; }
+      $('level').style.width = Math.min(100, peakLevel * 100) + '%'; peakLevel = 0; }, 50);
+    sendSettings();
+    $('start').textContent = 'Listening...';
+    $('start').disabled = true;
+    $('status').textContent = 'Listening. Waiting for the start noise.';
+  } catch (err) {
+    $('status').textContent = 'Could not access the microphone: ' + err.message;
+  }
+};
+
+$('reset').onclick = () => {
+  firstHit = null; document.body.classList.remove('timing'); results = []; speeds = [];
+  $('speed').textContent = '-- m/s'; lockUntil = 0; locked = false;
+  $('result').textContent = '-- ms';
+  $('status').textContent = ctx ? 'Listening. Waiting for the start noise.' : 'Press Start listening, then make the start noise and the stop noise.';
+  render();
+};
+</script>
+</body>
+</html>
